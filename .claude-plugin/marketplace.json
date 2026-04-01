@@ -1,0 +1,18 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "butler-plugins",
+  "description": "Butler Claude plugin marketplace — Telegram channel with forum topic routing",
+  "owner": {
+    "name": "yeonwoo-jo",
+    "email": ""
+  },
+  "plugins": [
+    {
+      "name": "telegram",
+      "description": "Telegram channel plugin with forum topic routing and steward subsession support",
+      "category": "communication",
+      "source": "./plugins/telegram",
+      "homepage": "https://github.com/byeolbit/butler-plugins-marketplace"
+    }
+  ]
+}

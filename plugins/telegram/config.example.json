@@ -1,0 +1,14 @@
+{
+  "topicRouting": {
+    "enabled": true,
+    "configSource": "~/dev/your-project/butler.config.json",
+    "tmuxSession": "butler",
+    "scripts": {
+      "send": "~/dev/your-project/scripts/subsession-send.sh",
+      "start": "~/dev/your-project/scripts/subsession-start.sh"
+    },
+    "topics": {
+      "TOPIC_ID": { "project": "project-name", "path": "~/dev/project-name" }
+    }
+  }
+}

@@ -1,0 +1,7 @@
+node_modules/
+.env
+config.json
+access.json
+approved/
+inbox/
+*.lock
