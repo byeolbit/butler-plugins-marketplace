@@ -12,7 +12,7 @@
       "description": "Telegram channel plugin with forum topic routing and steward subsession support",
       "category": "communication",
       "source": "./plugins/telegram",
-      "homepage": "https://github.com/byeolbit/butler-plugins-marketplace"
+      "homepage": "https://github.com/hexpy-games/butler-plugins-marketplace"
     }
   ]
 }
