@@ -1,0 +1,13 @@
+Butler Plugins Marketplace
+Copyright 2026 byeolbit
+
+This product includes software developed by Anthropic, PBC.
+The Telegram plugin is based on the official Claude Code Telegram plugin
+(https://github.com/anthropics/claude-plugins-official), licensed under Apache 2.0.
+
+Modifications from the original:
+- Added forum topic routing with configurable thread-to-project mapping
+- Added subsession support for steward pattern
+- Externalized configuration to config.json
+- Added thread management skills (register/edit/remove)
+- Removed hardcoded butler-specific values
