@@ -160,6 +160,204 @@ function runCmd(cmd: string, timeoutMs = 5000): Promise<string> {
   })
 }
 
+// ── Butler integration helpers ────────────────────────────────────────────────
+// Read butler state directly from disk. The telegram plugin is butler-specific
+// (already shells out to restart-butler.sh, references pm2 butler-main); these
+// helpers stay self-contained — they don't import from butler's mcp-server.
+const BUTLER_HOME = process.env.BUTLER_HOME ?? join(homedir(), '.butler')
+const BUTLER_DATA = process.env.BUTLER_DATA ?? join(BUTLER_HOME, 'data')
+const BUTLER_TASKS_DIR = join(BUTLER_DATA, 'tasks')
+const BUTLER_CONFIG_DIR = join(BUTLER_DATA, 'config')
+const BUTLER_PERSONAS_DIR = join(BUTLER_HOME, 'personas')
+const BUTLER_ACTIVE_PERSONA = join(BUTLER_HOME, 'personas', 'active.md')
+const BUTLER_GRAPH_DB = join(BUTLER_DATA, 'memory', 'db', 'graph.sqlite')
+
+const VALID_MODELS = ['sonnet', 'opus', 'haiku', 'sonnet[1m]', 'opus[1m]', 'opusplan'] as const
+const PERSONA_PRESETS = ['classic', 'pragmatic', 'friendly', 'hacker'] as const
+
+type TaskInfo = {
+  taskId: string
+  status: string
+  project: string
+  request: string
+  result?: string
+}
+
+function safeRead(p: string): string {
+  try { return readFileSync(p, 'utf8').trim() } catch { return '' }
+}
+
+function readTaskInfo(taskId: string, includeResult = false): TaskInfo | null {
+  // Defend against path traversal — task IDs are timestamps, no slashes ever.
+  if (!/^[A-Za-z0-9_.-]+$/.test(taskId)) return null
+  const dir = join(BUTLER_TASKS_DIR, taskId)
+  try { statSync(dir) } catch { return null }
+  const status = safeRead(join(dir, 'status')) || 'UNKNOWN'
+  const project = safeRead(join(dir, 'project'))
+  const request = safeRead(join(dir, 'request.md'))
+  const result = includeResult && (status === 'DONE' || status === 'FAILED')
+    ? safeRead(join(dir, 'result.md'))
+    : undefined
+  return { taskId, status, project, request, result }
+}
+
+function listRecentTasks(limit = 10): TaskInfo[] {
+  let entries: string[]
+  try { entries = readdirSync(BUTLER_TASKS_DIR) } catch { return [] }
+  // Task IDs are concat of epoch + pid + rand → lexicographic desc ≈ newest first.
+  entries.sort((a, b) => b.localeCompare(a))
+  const out: TaskInfo[] = []
+  for (const id of entries) {
+    const info = readTaskInfo(id, false)
+    if (info) out.push(info)
+    if (out.length >= limit) break
+  }
+  return out
+}
+
+function listButlerProjects(): { project: string; total: number; running: number; done: number; failed: number }[] {
+  let entries: string[]
+  try { entries = readdirSync(BUTLER_TASKS_DIR) } catch { return [] }
+  const map = new Map<string, { total: number; running: number; done: number; failed: number; latest: string }>()
+  for (const id of entries) {
+    const dir = join(BUTLER_TASKS_DIR, id)
+    const project = safeRead(join(dir, 'project'))
+    if (!project) continue
+    const status = safeRead(join(dir, 'status'))
+    const cur = map.get(project) ?? { total: 0, running: 0, done: 0, failed: 0, latest: '' }
+    cur.total++
+    if (status === 'RUNNING') cur.running++
+    else if (status === 'DONE') cur.done++
+    else if (status === 'FAILED') cur.failed++
+    if (id > cur.latest) cur.latest = id
+    map.set(project, cur)
+  }
+  return [...map.entries()]
+    .map(([project, v]) => ({ project, ...v }))
+    .sort((a, b) => b.latest.localeCompare(a.latest))
+    .map(({ project, total, running, done, failed }) => ({ project, total, running, done, failed }))
+}
+
+function listButlerSkills(): { name: string; description: string; plugin: string }[] {
+  const out: { name: string; description: string; plugin: string }[] = []
+  const pluginDirs = process.env.BUTLER_PLUGIN_DIRS
+    ? process.env.BUTLER_PLUGIN_DIRS.split(':').map(p => p.replace(/^~/, homedir()))
+    : [join(BUTLER_HOME, 'butler-core'), join(BUTLER_HOME, 'butler-skills')]
+  for (const pluginDir of pluginDirs) {
+    let pluginName = 'unknown'
+    try {
+      const pj = JSON.parse(readFileSync(join(pluginDir, '.claude-plugin', 'plugin.json'), 'utf8'))
+      pluginName = pj.name ?? 'unknown'
+    } catch {}
+    let entries: string[]
+    try { entries = readdirSync(join(pluginDir, 'skills')) } catch { continue }
+    for (const e of entries) {
+      const skillFile = join(pluginDir, 'skills', e, 'SKILL.md')
+      const raw = safeRead(skillFile)
+      if (!raw) continue
+      const fm = raw.match(/^---\n([\s\S]*?)\n---/)
+      if (!fm) continue
+      const meta: Record<string, string> = {}
+      for (const line of fm[1].split('\n')) {
+        const i = line.indexOf(':')
+        if (i === -1) continue
+        meta[line.slice(0, i).trim()] = line.slice(i + 1).trim()
+      }
+      if (!meta.name) continue
+      out.push({ name: meta.name, description: meta.description ?? '', plugin: pluginName })
+    }
+  }
+  return out
+}
+
+function getCurrentModels(): { worker: string; butler: string } {
+  return {
+    worker: safeRead(join(BUTLER_CONFIG_DIR, 'model.txt')) || 'sonnet',
+    butler: safeRead(join(BUTLER_CONFIG_DIR, 'butler-model.txt')) || 'sonnet',
+  }
+}
+
+function setWorkerModel(model: string): void {
+  if (!(VALID_MODELS as readonly string[]).includes(model)) {
+    throw new Error(`Invalid model "${model}". Valid: ${VALID_MODELS.join(', ')}`)
+  }
+  mkdirSync(BUTLER_CONFIG_DIR, { recursive: true })
+  writeFileSync(join(BUTLER_CONFIG_DIR, 'model.txt'), model + '\n')
+}
+
+function getActivePersona(): { base: string; name: string } {
+  const raw = safeRead(BUTLER_ACTIVE_PERSONA)
+  const base = raw.match(/^base:\s*(\S+)/m)?.[1] ?? 'unknown'
+  const name = raw.match(/^name:\s*(\S+)/m)?.[1] ?? 'active'
+  return { base, name }
+}
+
+function setActivePersona(preset: string): void {
+  if (!(PERSONA_PRESETS as readonly string[]).includes(preset)) {
+    throw new Error(`Invalid persona "${preset}". Valid: ${PERSONA_PRESETS.join(', ')}`)
+  }
+  const tmpl = readFileSync(join(BUTLER_PERSONAS_DIR, 'templates', `${preset}.md`), 'utf8')
+  // Rewrite frontmatter: name=active, base=preset (mirrors generate-persona.sh).
+  const rewritten = tmpl.replace(
+    /^---\nname:\s*\w+/m,
+    `---\nname: active\nbase: ${preset}`,
+  )
+  mkdirSync(BUTLER_PERSONAS_DIR, { recursive: true })
+  writeFileSync(BUTLER_ACTIVE_PERSONA, rewritten)
+}
+
+async function queryMemoryGraph(query: string, limit = 8): Promise<{ name: string; type: string; project: string | null }[]> {
+  // Use bun:sqlite to read the graph DB read-only. Returns [] if DB absent.
+  try { statSync(BUTLER_GRAPH_DB) } catch { return [] }
+  const { Database } = await import('bun:sqlite')
+  const db = new Database(BUTLER_GRAPH_DB, { readonly: true })
+  try {
+    const rows = db
+      .query<{ name: string; type: string; project: string | null }, [string, number]>(
+        `SELECT name, type, project FROM entities
+         WHERE name LIKE ?1 COLLATE NOCASE
+         ORDER BY updated_at DESC
+         LIMIT ?2`,
+      )
+      .all(`%${query}%`, limit)
+    return rows
+  } finally {
+    db.close()
+  }
+}
+
+function shellEscape(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`
+}
+
+function dispatchTask(text: string, projectPath: string): { taskId: string } {
+  // Fire-and-forget — dispatch.sh blocks for the worker run, so background it
+  // with nohup. TASK_ID_OVERRIDE lets the bot acknowledge with a real ID.
+  const ts = Date.now()
+  const rand = Math.floor(Math.random() * 10000)
+  const taskId = `${ts}${process.pid}${rand}`
+  const dispatch = join(BUTLER_HOME, 'scripts', 'dispatch.sh')
+  const cmd = `nohup env TASK_ID_OVERRIDE=${taskId} bash ${shellEscape(dispatch)} ${shellEscape(text)} ${shellEscape(projectPath)} >/dev/null 2>&1 &`
+  const child = spawn('bash', ['-c', cmd], { detached: true, stdio: 'ignore' })
+  child.unref()
+  return { taskId }
+}
+
+export const __butlerHelpers = {
+  readTaskInfo,
+  listRecentTasks,
+  listButlerProjects,
+  listButlerSkills,
+  getCurrentModels,
+  setWorkerModel,
+  getActivePersona,
+  setActivePersona,
+  queryMemoryGraph,
+  shellEscape,
+  VALID_MODELS,
+  PERSONA_PRESETS,
+}
+
 // reply's files param takes any path. .env is ~60 bytes and ships as a
 // document. Claude can already Read+paste file contents, so this isn't a new
 // exfil channel for arbitrary paths — but the server's own state is the one
@@ -715,7 +913,13 @@ bot.command('help', async ctx => {
     `Messages you send here route to a paired Claude Code session. ` +
     `Text and photos are forwarded; replies and reactions come back.\n\n` +
     `/start — pairing instructions\n` +
-    `/status — check your pairing state`
+    `/status — check your pairing state\n` +
+    `/tasks · /task ID — recent worker tasks (admin)\n` +
+    `/projects · /skills — butler inventory (admin)\n` +
+    `/memory QUERY — search memory graph (admin)\n` +
+    `/model · /persona — switch worker model / persona (admin)\n` +
+    `/dispatch TEXT — fire a task to a worker (admin)\n` +
+    `/restart · /kill — control butler-main (admin)`
   )
 })
 
@@ -814,6 +1018,263 @@ bot.command('kill', async ctx => {
   await ctx.reply('Confirm kill of butler-main?', { reply_markup: keyboard })
 })
 
+// ── Slash commands: butler integration ────────────────────────────────────────
+
+// Admin gate — re-reads access.json each call so /telegram:access changes
+// take effect immediately.
+function isAdmin(senderId: string | undefined): boolean {
+  if (!senderId) return false
+  return loadAccess().allowFrom.includes(senderId)
+}
+
+
+bot.command('tasks', async ctx => {
+  if (ctx.chat?.type !== 'private') return
+  if (!isAdmin(String(ctx.from?.id ?? ''))) {
+    await ctx.reply('Not authorized.')
+    return
+  }
+  try {
+    const tasks = listRecentTasks(10)
+    if (tasks.length === 0) {
+      await ctx.reply('No tasks found.')
+      return
+    }
+    const lines = tasks.map(t => {
+      const status = escapeMarkdownV2(t.status.padEnd(7))
+      const id = escapeMarkdownV2(t.taskId)
+      const proj = escapeMarkdownV2((t.project || '?').slice(0, 16))
+      const req = escapeMarkdownV2(t.request.slice(0, 60).replace(/\s+/g, ' '))
+      return `\`${id}\` ${status} ${proj} — ${req}`
+    })
+    await ctx.reply(`*Recent tasks \\(top ${tasks.length}\\)*\n${lines.join('\n')}`, { parse_mode: 'MarkdownV2' })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    await ctx.reply(`Error listing tasks: ${escapeMarkdownV2(msg)}`, { parse_mode: 'MarkdownV2' })
+  }
+})
+
+bot.command('task', async ctx => {
+  if (ctx.chat?.type !== 'private') return
+  if (!isAdmin(String(ctx.from?.id ?? ''))) {
+    await ctx.reply('Not authorized.')
+    return
+  }
+  const arg = ctx.match?.toString().trim()
+  if (!arg) {
+    await ctx.reply('Usage: /task <task_id>')
+    return
+  }
+  try {
+    const info = readTaskInfo(arg, true)
+    if (!info) {
+      await ctx.reply(`Task not found: ${escapeMarkdownV2(arg)}`, { parse_mode: 'MarkdownV2' })
+      return
+    }
+    const sections = [
+      `*Task* \`${escapeMarkdownV2(info.taskId)}\``,
+      `*Status:* ${escapeMarkdownV2(info.status)}`,
+      `*Project:* ${escapeMarkdownV2(info.project || '?')}`,
+      `*Request:*\n${escapeMarkdownV2(info.request.slice(0, 800))}`,
+    ]
+    if (info.result) {
+      sections.push(`*Result:*\n${escapeMarkdownV2(info.result.slice(0, 1500))}`)
+    }
+    await ctx.reply(sections.join('\n\n'), { parse_mode: 'MarkdownV2' })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    await ctx.reply(`Error reading task: ${escapeMarkdownV2(msg)}`, { parse_mode: 'MarkdownV2' })
+  }
+})
+
+bot.command('memory', async ctx => {
+  if (ctx.chat?.type !== 'private') return
+  if (!isAdmin(String(ctx.from?.id ?? ''))) {
+    await ctx.reply('Not authorized.')
+    return
+  }
+  const query = ctx.match?.toString().trim()
+  if (!query) {
+    await ctx.reply('Usage: /memory <query>')
+    return
+  }
+  try {
+    const rows = await queryMemoryGraph(query, 8)
+    if (rows.length === 0) {
+      await ctx.reply(`No memory entities matching "${escapeMarkdownV2(query)}"\\.`, { parse_mode: 'MarkdownV2' })
+      return
+    }
+    const lines = rows.map(r => {
+      const proj = r.project ? ` \\[${escapeMarkdownV2(r.project)}\\]` : ''
+      return `• *${escapeMarkdownV2(r.name)}* \\(${escapeMarkdownV2(r.type)}\\)${proj}`
+    })
+    await ctx.reply(`*Memory: ${escapeMarkdownV2(query)}*\n${lines.join('\n')}`, { parse_mode: 'MarkdownV2' })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    await ctx.reply(`Memory query failed: ${escapeMarkdownV2(msg)}`, { parse_mode: 'MarkdownV2' })
+  }
+})
+
+bot.command('model', async ctx => {
+  if (ctx.chat?.type !== 'private') return
+  if (!isAdmin(String(ctx.from?.id ?? ''))) {
+    await ctx.reply('Not authorized.')
+    return
+  }
+  try {
+    const cur = getCurrentModels()
+    const kb = new InlineKeyboard()
+    for (const [i, m] of VALID_MODELS.entries()) {
+      kb.text(m === cur.worker ? `✅ ${m}` : m, `model:set:${m}`)
+      if (i % 2 === 1) kb.row()
+    }
+    await ctx.reply(
+      `*Current models*\nworker: \`${escapeMarkdownV2(cur.worker)}\`\nbutler: \`${escapeMarkdownV2(cur.butler)}\`\n\nTap to set worker model:`,
+      { parse_mode: 'MarkdownV2', reply_markup: kb },
+    )
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    await ctx.reply(`Error reading model: ${escapeMarkdownV2(msg)}`, { parse_mode: 'MarkdownV2' })
+  }
+})
+
+bot.command('projects', async ctx => {
+  if (ctx.chat?.type !== 'private') return
+  if (!isAdmin(String(ctx.from?.id ?? ''))) {
+    await ctx.reply('Not authorized.')
+    return
+  }
+  try {
+    const projs = listButlerProjects()
+    if (projs.length === 0) {
+      await ctx.reply('No projects with tasks.')
+      return
+    }
+    const lines = projs.slice(0, 12).map(p => {
+      const parts: string[] = []
+      if (p.running > 0) parts.push(`${p.running} running`)
+      parts.push(`${p.done} done`)
+      if (p.failed > 0) parts.push(`${p.failed} failed`)
+      return `• *${escapeMarkdownV2(p.project)}* — ${p.total} tasks \\(${escapeMarkdownV2(parts.join(', '))}\\)`
+    })
+    await ctx.reply(`*Projects*\n${lines.join('\n')}`, { parse_mode: 'MarkdownV2' })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    await ctx.reply(`Error listing projects: ${escapeMarkdownV2(msg)}`, { parse_mode: 'MarkdownV2' })
+  }
+})
+
+bot.command('skills', async ctx => {
+  if (ctx.chat?.type !== 'private') return
+  if (!isAdmin(String(ctx.from?.id ?? ''))) {
+    await ctx.reply('Not authorized.')
+    return
+  }
+  try {
+    const skills = listButlerSkills()
+    if (skills.length === 0) {
+      await ctx.reply('No skills loaded.')
+      return
+    }
+    const lines = skills.slice(0, 25).map(s =>
+      `• *${escapeMarkdownV2(s.name)}* \\(${escapeMarkdownV2(s.plugin)}\\) — ${escapeMarkdownV2(s.description.slice(0, 100))}`,
+    )
+    await ctx.reply(`*Skills \\(${skills.length}\\)*\n${lines.join('\n')}`, { parse_mode: 'MarkdownV2' })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    await ctx.reply(`Error listing skills: ${escapeMarkdownV2(msg)}`, { parse_mode: 'MarkdownV2' })
+  }
+})
+
+bot.command('persona', async ctx => {
+  if (ctx.chat?.type !== 'private') return
+  if (!isAdmin(String(ctx.from?.id ?? ''))) {
+    await ctx.reply('Not authorized.')
+    return
+  }
+  try {
+    const cur = getActivePersona()
+    const kb = new InlineKeyboard()
+    for (const [i, p] of PERSONA_PRESETS.entries()) {
+      kb.text(p === cur.base ? `✅ ${p}` : p, `persona:set:${p}`)
+      if (i % 2 === 1) kb.row()
+    }
+    await ctx.reply(
+      `*Active persona:* \`${escapeMarkdownV2(cur.base)}\`\n\nTap to switch:`,
+      { parse_mode: 'MarkdownV2', reply_markup: kb },
+    )
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    await ctx.reply(`Error reading persona: ${escapeMarkdownV2(msg)}`, { parse_mode: 'MarkdownV2' })
+  }
+})
+
+bot.command('dispatch', async ctx => {
+  if (ctx.chat?.type !== 'private') return
+  if (!isAdmin(String(ctx.from?.id ?? ''))) {
+    await ctx.reply('Not authorized.')
+    return
+  }
+  const text = ctx.match?.toString().trim()
+  if (!text) {
+    await ctx.reply('Reply to this with the task description:', {
+      reply_markup: { force_reply: true, selective: true, input_field_placeholder: 'task description…' },
+    })
+    return
+  }
+  try {
+    const projectPath = process.env.BUTLER_DEFAULT_PROJECT_PATH ?? join(homedir(), 'dev')
+    const { taskId } = dispatchTask(text, projectPath)
+    await ctx.reply(
+      `*Dispatched* \`${escapeMarkdownV2(taskId)}\`\nproject: \`${escapeMarkdownV2(projectPath)}\`\n\nCheck progress: /task ${escapeMarkdownV2(taskId)}`,
+      { parse_mode: 'MarkdownV2' },
+    )
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    await ctx.reply(`Dispatch failed: ${escapeMarkdownV2(msg)}`, { parse_mode: 'MarkdownV2' })
+  }
+})
+
+// Dispatch ForceReply follow-up — when a non-empty text reply targets the
+// bot's "Reply to this with the task description:" prompt, treat it as a
+// /dispatch invocation. Registered before the catch-all message:text handler
+// so it intercepts the reply before it would be forwarded to Claude.
+const DISPATCH_PROMPT = 'Reply to this with the task description:'
+bot.on('message:text', async (ctx, next) => {
+  const reply = ctx.message.reply_to_message
+  const fromBot = reply?.from?.id === ctx.me.id
+  const isPrompt = reply && 'text' in reply && reply.text === DISPATCH_PROMPT
+  if (!fromBot || !isPrompt) {
+    await next()
+    return
+  }
+  if (ctx.chat?.type !== 'private') {
+    await next()
+    return
+  }
+  if (!isAdmin(String(ctx.from?.id ?? ''))) {
+    await ctx.reply('Not authorized.')
+    return
+  }
+  const text = ctx.message.text.trim()
+  if (!text) {
+    await ctx.reply('Empty task — ignored.')
+    return
+  }
+  try {
+    const projectPath = process.env.BUTLER_DEFAULT_PROJECT_PATH ?? join(homedir(), 'dev')
+    const { taskId } = dispatchTask(text, projectPath)
+    await ctx.reply(
+      `*Dispatched* \`${escapeMarkdownV2(taskId)}\`\nproject: \`${escapeMarkdownV2(projectPath)}\``,
+      { parse_mode: 'MarkdownV2' },
+    )
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    await ctx.reply(`Dispatch failed: ${escapeMarkdownV2(msg)}`, { parse_mode: 'MarkdownV2' })
+  }
+})
+
+
 // Inline-button handler for permission requests. Callback data is
 // `perm:allow:<id>`, `perm:deny:<id>`, or `perm:more:<id>`.
 // Security mirrors the text-reply path: allowFrom must contain the sender.
@@ -843,6 +1304,54 @@ bot.on('callback_query:data', async ctx => {
       { detached: true, stdio: 'ignore' },
     )
     child.unref()
+    return
+  }
+
+  // Worker-model switch flow — `model:set:<alias>`. Re-checks admin per tap.
+  const modelM = /^model:set:(.+)$/.exec(data)
+  if (modelM) {
+    const access = loadAccess()
+    const senderId = String(ctx.from.id)
+    if (!access.allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    const alias = modelM[1]!
+    try {
+      setWorkerModel(alias)
+      await ctx.answerCallbackQuery({ text: `Worker → ${alias}` }).catch(() => {})
+      await ctx.editMessageText(
+        `Worker model set to \`${escapeMarkdownV2(alias)}\``,
+        { parse_mode: 'MarkdownV2' },
+      ).catch(() => {})
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      await ctx.answerCallbackQuery({ text: msg.slice(0, 200) }).catch(() => {})
+    }
+    return
+  }
+
+  // Persona switch flow — `persona:set:<preset>`. Mirrors model flow.
+  const personaM = /^persona:set:(.+)$/.exec(data)
+  if (personaM) {
+    const access = loadAccess()
+    const senderId = String(ctx.from.id)
+    if (!access.allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    const preset = personaM[1]!
+    try {
+      setActivePersona(preset)
+      await ctx.answerCallbackQuery({ text: `Persona → ${preset}` }).catch(() => {})
+      await ctx.editMessageText(
+        `Persona switched to \`${escapeMarkdownV2(preset)}\` \\(applies on next butler restart\\)`,
+        { parse_mode: 'MarkdownV2' },
+      ).catch(() => {})
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      await ctx.answerCallbackQuery({ text: msg.slice(0, 200) }).catch(() => {})
+    }
     return
   }
 
@@ -1156,6 +1665,14 @@ void (async () => {
               { command: 'start', description: 'Welcome and setup guide' },
               { command: 'help', description: 'What this bot can do' },
               { command: 'status', description: 'Check pairing / butler process state' },
+              { command: 'tasks', description: 'List recent tasks (admin)' },
+              { command: 'task', description: 'Show one task by ID (admin)' },
+              { command: 'projects', description: 'List butler projects (admin)' },
+              { command: 'skills', description: 'List loaded skills (admin)' },
+              { command: 'memory', description: 'Search memory graph (admin)' },
+              { command: 'model', description: 'View / set worker model (admin)' },
+              { command: 'persona', description: 'View / switch persona (admin)' },
+              { command: 'dispatch', description: 'Dispatch a task to a worker (admin)' },
               { command: 'restart', description: 'Restart butler-main (admin)' },
               { command: 'kill', description: 'Stop butler-main (admin, confirm)' },
             ],
