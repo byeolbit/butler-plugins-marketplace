@@ -18,7 +18,7 @@ import {
 import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
-import { exec } from 'child_process'
+import { exec, spawn } from 'child_process'
 import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
@@ -144,6 +144,21 @@ function defaultAccess(): Access {
 
 const MAX_CHUNK_LIMIT = 4096
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
+
+// MarkdownV2 escape — Telegram Bot API requires escaping these in normal text:
+// _ * [ ] ( ) ~ ` > # + - = | { } . !   (plus backslash itself).
+function escapeMarkdownV2(s: string): string {
+  return String(s).replace(/[\\_*\[\]()~`>#+\-=|{}.!]/g, '\\$&')
+}
+
+function runCmd(cmd: string, timeoutMs = 5000): Promise<string> {
+  return new Promise((resolve, reject) => {
+    exec(cmd, { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
+      if (err) reject(err)
+      else resolve(stdout)
+    })
+  })
+}
 
 // reply's files param takes any path. .env is ~60 bytes and ships as a
 // document. Claude can already Read+paste file contents, so this isn't a new
@@ -713,7 +728,36 @@ bot.command('status', async ctx => {
 
   if (access.allowFrom.includes(senderId)) {
     const name = from.username ? `@${from.username}` : senderId
-    await ctx.reply(`Paired as ${name}.`)
+    const header = `Paired as ${escapeMarkdownV2(name)}\\.`
+
+    // Admin extension — append pm2 process table. All substrings from pm2 jlist
+    // are escaped for MarkdownV2 (process names contain '-', status strings and
+    // restart counts are plain, but memory/uptime etc. contain '.'/':' in many
+    // fields — escape everything we didn't author).
+    let adminSection = ''
+    try {
+      const raw = await runCmd('pm2 jlist')
+      const jlist = JSON.parse(raw) as Array<{
+        name: string
+        pm2_env?: { status?: string; restart_time?: number }
+      }>
+      if (Array.isArray(jlist) && jlist.length > 0) {
+        const rows = jlist.map(p => {
+          const name = escapeMarkdownV2(p.name ?? '?')
+          const status = escapeMarkdownV2(p.pm2_env?.status ?? '?')
+          const restarts = escapeMarkdownV2(String(p.pm2_env?.restart_time ?? 0))
+          return `• ${name}: ${status} \\(restarts: ${restarts}\\)`
+        }).join('\n')
+        adminSection = `\n\n*Butler process state*\n${rows}`
+      } else {
+        adminSection = `\n\n*Butler process state*\n${escapeMarkdownV2('(pm2 jlist empty)')}`
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      adminSection = `\n\n*Butler process state*\n${escapeMarkdownV2(`pm2 jlist failed: ${msg}`)}`
+    }
+
+    await ctx.reply(`${header}${adminSection}`, { parse_mode: 'MarkdownV2' })
     return
   }
 
@@ -729,11 +773,79 @@ bot.command('status', async ctx => {
   await ctx.reply(`Not paired. Send me a message to get a pairing code.`)
 })
 
+// Emergency control — /restart. Must survive its own death: reply first so the
+// message is durable at Telegram, then detached-spawn the restart script so it
+// outlives grammy's SIGTERM when pm2 tears down butler-main's tmux tree.
+// Mirrors the proven pattern in mcp-server/server.ts:211 (restart_butler tool).
+bot.command('restart', async ctx => {
+  if (ctx.chat?.type !== 'private') return
+  const senderId = String(ctx.from?.id ?? '')
+  const access = loadAccess()
+  if (!access.allowFrom.includes(senderId)) {
+    await ctx.reply('Not authorized.')
+    return
+  }
+  await ctx.reply(
+    escapeMarkdownV2('Restarting butler-main… new startup notification in ~10s.'),
+    { parse_mode: 'MarkdownV2' },
+  )
+  const child = spawn(
+    'bash',
+    ['-c', 'nohup bash "$HOME/.butler/scripts/restart-butler.sh" >/dev/null 2>&1 &'],
+    { detached: true, stdio: 'ignore' },
+  )
+  child.unref()
+})
+
+// Emergency control — /kill. Two-step confirmation via inline keyboard to
+// guard against fat-finger. Non-admins get a single "Not authorized" reply
+// with no further action.
+bot.command('kill', async ctx => {
+  if (ctx.chat?.type !== 'private') return
+  const senderId = String(ctx.from?.id ?? '')
+  const access = loadAccess()
+  if (!access.allowFrom.includes(senderId)) {
+    await ctx.reply('Not authorized.')
+    return
+  }
+  const keyboard = new InlineKeyboard()
+    .text('✅ Yes', 'kill:confirm')
+    .text('❌ No', 'kill:cancel')
+  await ctx.reply('Confirm kill of butler-main?', { reply_markup: keyboard })
+})
+
 // Inline-button handler for permission requests. Callback data is
 // `perm:allow:<id>`, `perm:deny:<id>`, or `perm:more:<id>`.
 // Security mirrors the text-reply path: allowFrom must contain the sender.
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
+
+  // Emergency /kill confirmation flow — re-verify admin on confirm to close
+  // the race where access.json changes between /kill invocation and tap.
+  const killM = /^kill:(confirm|cancel)$/.exec(data)
+  if (killM) {
+    const access = loadAccess()
+    const senderId = String(ctx.from.id)
+    if (!access.allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    if (killM[1] === 'cancel') {
+      await ctx.answerCallbackQuery({ text: 'Cancelled.' }).catch(() => {})
+      await ctx.editMessageText('Kill cancelled.').catch(() => {})
+      return
+    }
+    await ctx.answerCallbackQuery({ text: 'Stopping…' }).catch(() => {})
+    await ctx.editMessageText('Stopping butler-main…').catch(() => {})
+    const child = spawn(
+      'bash',
+      ['-c', 'nohup pm2 stop butler-main >/dev/null 2>&1 &'],
+      { detached: true, stdio: 'ignore' },
+    )
+    child.unref()
+    return
+  }
+
   const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(data)
   if (!m) {
     await ctx.answerCallbackQuery().catch(() => {})
@@ -1043,7 +1155,9 @@ void (async () => {
             [
               { command: 'start', description: 'Welcome and setup guide' },
               { command: 'help', description: 'What this bot can do' },
-              { command: 'status', description: 'Check your pairing status' },
+              { command: 'status', description: 'Check pairing / butler process state' },
+              { command: 'restart', description: 'Restart butler-main (admin)' },
+              { command: 'kill', description: 'Stop butler-main (admin, confirm)' },
             ],
             { scope: { type: 'all_private_chats' } },
           ).catch(() => {})
